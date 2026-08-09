@@ -1,54 +1,69 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ============================================================
-# Xray VLESS + REALITY installer
-#
-# Repository:
-#   ~/vless-reality-xray-installer
-#
-# Generated runtime/secrets:
-#   ~/vless-reality-xray-installer/runtime
-#
-# Xray configuration:
-#   /usr/local/etc/xray/config.json
-#
-# The runtime directory MUST NOT be committed to Git.
-# ============================================================
-
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-RUNTIME_DIR="${SCRIPT_DIR}/runtime"
 
-XRAY_CONFIG="/usr/local/etc/xray/config.json"
+# The normal user who invoked sudo.
+INSTALL_USER="${SUDO_USER:-${USER}}"
+
+if [[ "${INSTALL_USER}" == "root" ]]; then
+    echo "ERROR: Run this as:"
+    echo
+    echo "    sudo ./install-xray.sh"
+    echo
+    echo "from your normal Azure user."
+    exit 1
+fi
+
+INSTALL_GROUP="$(id -gn "${INSTALL_USER}")"
+
+RUNTIME_DIR="${SCRIPT_DIR}/runtime"
+BACKUP_DIR="${RUNTIME_DIR}/backups"
+
 XRAY_CONFIG_DIR="/usr/local/etc/xray"
+XRAY_CONFIG="${XRAY_CONFIG_DIR}/config.json"
 
 CLIENT_INFO="${RUNTIME_DIR}/client-info.txt"
 SERVER_INFO="${RUNTIME_DIR}/server-info.txt"
+
 PRIVATE_KEY_FILE="${RUNTIME_DIR}/reality-private-key.txt"
 PUBLIC_KEY_FILE="${RUNTIME_DIR}/reality-public-key.txt"
 UUID_FILE="${RUNTIME_DIR}/uuid.txt"
 SHORT_ID_FILE="${RUNTIME_DIR}/short-id.txt"
 TARGET_FILE="${RUNTIME_DIR}/target.txt"
 
-BACKUP_DIR="${RUNTIME_DIR}/backups"
-
 # ------------------------------------------------------------
-# Helpers
+# Helper
 # ------------------------------------------------------------
 
 die() {
     echo
-    echo "ERROR: $*"
+    echo "============================================================"
+    echo "ERROR"
+    echo "============================================================"
+    echo
+    echo "$*"
     echo
     exit 1
 }
 
-command_exists() {
-    command -v "$1" >/dev/null 2>&1
-}
+echo
+echo "============================================================"
+echo " Xray VLESS + REALITY Installer"
+echo "============================================================"
+echo
+echo "Install user:"
+echo "  ${INSTALL_USER}"
+echo
+echo "Repository:"
+echo "  ${SCRIPT_DIR}"
+echo
+echo "Runtime:"
+echo "  ${RUNTIME_DIR}"
+echo
 
 # ------------------------------------------------------------
-# Check root
+# Root check
 # ------------------------------------------------------------
 
 if [[ "${EUID}" -ne 0 ]]; then
@@ -57,20 +72,15 @@ if [[ "${EUID}" -ne 0 ]]; then
     sudo ./install-xray.sh"
 fi
 
-echo
-echo "============================================================"
-echo " Xray VLESS + REALITY Installer"
-echo "============================================================"
-echo
-echo "Repository:"
-echo "  ${SCRIPT_DIR}"
-echo
-echo "Runtime data:"
-echo "  ${RUNTIME_DIR}"
-echo
+# ------------------------------------------------------------
+# Verify normal user exists
+# ------------------------------------------------------------
+
+id "${INSTALL_USER}" >/dev/null 2>&1 ||
+    die "User '${INSTALL_USER}' does not exist."
 
 # ------------------------------------------------------------
-# 1. Create runtime directory
+# 1. Prepare runtime
 # ------------------------------------------------------------
 
 echo "[1/9] Preparing runtime directory..."
@@ -78,17 +88,38 @@ echo "[1/9] Preparing runtime directory..."
 mkdir -p "${RUNTIME_DIR}"
 mkdir -p "${BACKUP_DIR}"
 
-# Only root should be able to read generated secrets.
-chown -R root:root "${RUNTIME_DIR}"
+# Let the normal Azure user manage runtime completely.
+chown -R "${INSTALL_USER}:${INSTALL_GROUP}" "${RUNTIME_DIR}"
+
+# User can enter/read/write runtime.
 chmod 700 "${RUNTIME_DIR}"
 chmod 700 "${BACKUP_DIR}"
 
 # ------------------------------------------------------------
-# 2. Install required packages
+# 2. Make sure runtime is ignored by Git
 # ------------------------------------------------------------
 
 echo
-echo "[2/9] Installing required packages..."
+echo "[2/9] Configuring Git protection..."
+
+GITIGNORE="${SCRIPT_DIR}/.gitignore"
+
+touch "${GITIGNORE}"
+
+if ! grep -qxF "runtime/" "${GITIGNORE}"; then
+    printf '%s\n' "runtime/" >> "${GITIGNORE}"
+fi
+
+chown "${INSTALL_USER}:${INSTALL_GROUP}" "${GITIGNORE}"
+
+echo "runtime/ is protected from Git commits."
+
+# ------------------------------------------------------------
+# 3. Install dependencies
+# ------------------------------------------------------------
+
+echo
+echo "[3/9] Installing required packages..."
 
 apt-get update
 
@@ -100,34 +131,35 @@ apt-get install -y \
     jq
 
 # ------------------------------------------------------------
-# 3. Install/update Xray
+# 4. Install/update Xray
 # ------------------------------------------------------------
 
 echo
-echo "[3/9] Installing/updating Xray..."
+echo "[4/9] Installing/updating Xray..."
 
 bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
 
-command_exists xray || die "Xray installation failed."
+command -v xray >/dev/null 2>&1 ||
+    die "Xray installation failed."
 
 echo
-echo "Installed Xray:"
+echo "Installed:"
 xray version
 
 # ------------------------------------------------------------
-# 4. Select REALITY target
+# 5. REALITY target
 # ------------------------------------------------------------
 
 echo
-echo "[4/9] Selecting REALITY target"
+echo "[5/9] Selecting REALITY target"
 echo
 echo "Enter a normal HTTPS hostname."
 echo
-echo "The target will be tested with:"
+echo "It will be tested with:"
 echo
 echo "    xray tls ping HOST:443"
 echo
-echo "Press ENTER to use:"
+echo "Press ENTER for:"
 echo
 echo "    www.cloudflare.com"
 echo
@@ -136,23 +168,23 @@ read -r -p "Target hostname [www.cloudflare.com]: " TARGET
 
 TARGET="${TARGET:-www.cloudflare.com}"
 
-# Clean accidental protocol/path/port input.
+# Clean common accidental input.
 TARGET="${TARGET#https://}"
 TARGET="${TARGET#http://}"
 TARGET="${TARGET%%/*}"
 TARGET="${TARGET%%:*}"
 
-[[ -n "${TARGET}" ]] || die "Target hostname is empty."
+[[ -n "${TARGET}" ]] ||
+    die "Target hostname is empty."
 
 echo
-echo "Testing:"
-echo "    ${TARGET}:443"
+echo "Testing ${TARGET}:443 ..."
 echo
 
 if ! xray tls ping "${TARGET}:443"; then
     die "TLS test failed for ${TARGET}:443.
 
-Choose another HTTPS hostname and run the installer again."
+Choose another valid HTTPS hostname and run the installer again."
 fi
 
 echo
@@ -161,40 +193,42 @@ echo "TLS target test succeeded."
 printf '%s\n' "${TARGET}" > "${TARGET_FILE}"
 
 # ------------------------------------------------------------
-# 5. Generate UUID
+# 6. Generate UUID
 # ------------------------------------------------------------
 
 echo
-echo "[5/9] Generating VLESS UUID..."
+echo "[6/9] Generating UUID..."
 
 UUID="$(xray uuid | tr -d '\r\n[:space:]')"
 
-[[ -n "${UUID}" ]] || die "Could not generate UUID."
+[[ -n "${UUID}" ]] ||
+    die "Could not generate UUID."
 
 printf '%s\n' "${UUID}" > "${UUID_FILE}"
 
 echo "UUID generated."
 
 # ------------------------------------------------------------
-# 6. Generate REALITY key pair
+# Generate REALITY X25519 keys
 # ------------------------------------------------------------
 
 echo
-echo "[6/9] Generating REALITY X25519 key pair..."
+echo "Generating REALITY X25519 key pair..."
 
 KEY_OUTPUT="$(xray x25519)"
 
 echo
-echo "Xray key generator:"
+echo "Xray key generator output:"
 echo "${KEY_OUTPUT}"
 echo
 
-# Current Xray format:
+# Xray 26.x:
 #
 # PrivateKey: ...
 # Password (PublicKey): ...
 # Hash32: ...
 #
+
 PRIVATE_KEY="$(
     printf '%s\n' "${KEY_OUTPUT}" |
     sed -n 's/^PrivateKey: //p' |
@@ -209,7 +243,7 @@ PUBLIC_KEY="$(
     tr -d '\r'
 )"
 
-# Compatibility fallback for older versions.
+# Older-version compatibility.
 if [[ -z "${PRIVATE_KEY}" ]]; then
     PRIVATE_KEY="$(
         printf '%s\n' "${KEY_OUTPUT}" |
@@ -237,41 +271,49 @@ if [[ -z "${PUBLIC_KEY}" ]]; then
     )"
 fi
 
-[[ -n "${PRIVATE_KEY}" ]] || die "Could not extract REALITY private key."
+[[ -n "${PRIVATE_KEY}" ]] ||
+    die "Could not extract REALITY private key."
 
-[[ -n "${PUBLIC_KEY}" ]] || die "Could not extract REALITY public key."
+[[ -n "${PUBLIC_KEY}" ]] ||
+    die "Could not extract REALITY public key."
 
 printf '%s\n' "${PRIVATE_KEY}" > "${PRIVATE_KEY_FILE}"
 printf '%s\n' "${PUBLIC_KEY}" > "${PUBLIC_KEY_FILE}"
 
-chmod 600 "${PRIVATE_KEY_FILE}"
-chmod 600 "${PUBLIC_KEY_FILE}"
-
-echo "REALITY key pair generated."
-
-# ------------------------------------------------------------
-# Generate short ID
-# ------------------------------------------------------------
-
+# Short ID.
 SHORT_ID="$(openssl rand -hex 8)"
 
 [[ "${SHORT_ID}" =~ ^[0-9a-f]{16}$ ]] ||
-    die "Generated invalid REALITY short ID."
+    die "Invalid short ID generated."
 
 printf '%s\n' "${SHORT_ID}" > "${SHORT_ID_FILE}"
 
-chmod 600 "${UUID_FILE}"
-chmod 600 "${SHORT_ID_FILE}"
-chmod 600 "${TARGET_FILE}"
+# All generated files belong to the normal user.
+chown "${INSTALL_USER}:${INSTALL_GROUP}" \
+    "${UUID_FILE}" \
+    "${PRIVATE_KEY_FILE}" \
+    "${PUBLIC_KEY_FILE}" \
+    "${SHORT_ID_FILE}" \
+    "${TARGET_FILE}"
 
+# User-readable/writable, not world-readable.
+chmod 600 \
+    "${UUID_FILE}" \
+    "${PRIVATE_KEY_FILE}" \
+    "${PUBLIC_KEY_FILE}" \
+    "${SHORT_ID_FILE}" \
+    "${TARGET_FILE}"
+
+echo
+echo "REALITY key pair generated."
 echo "Short ID generated."
 
 # ------------------------------------------------------------
-# 7. Backup existing Xray configuration
+# Backup existing config
 # ------------------------------------------------------------
 
 echo
-echo "[7/9] Preparing Xray configuration..."
+echo "[7/9] Creating Xray configuration..."
 
 mkdir -p "${XRAY_CONFIG_DIR}"
 
@@ -281,14 +323,15 @@ if [[ -f "${XRAY_CONFIG}" ]]; then
 
     cp "${XRAY_CONFIG}" "${BACKUP_FILE}"
 
+    chown "${INSTALL_USER}:${INSTALL_GROUP}" "${BACKUP_FILE}"
     chmod 600 "${BACKUP_FILE}"
 
-    echo "Existing configuration backed up:"
+    echo "Previous configuration backed up:"
     echo "  ${BACKUP_FILE}"
 fi
 
 # ------------------------------------------------------------
-# Write Xray configuration
+# Create Xray config
 # ------------------------------------------------------------
 
 cat > "${XRAY_CONFIG}" <<EOF
@@ -344,13 +387,14 @@ cat > "${XRAY_CONFIG}" <<EOF
 }
 EOF
 
-# IMPORTANT:
-# The Xray systemd service installed by the official installer
-# runs as "nobody". It therefore needs read access to config.json.
+# ------------------------------------------------------------
+# Xray systemd permission fix
+# ------------------------------------------------------------
 #
-# root owns the file.
-# group "nogroup" gets read access.
-# nobody belongs to nogroup on standard Ubuntu installations.
+# Official Xray systemd service normally runs as "nobody".
+# Give that service read access to the config while keeping
+# the private key inaccessible to normal non-root users.
+#
 
 chown root:nogroup "${XRAY_CONFIG}"
 chmod 640 "${XRAY_CONFIG}"
@@ -360,25 +404,28 @@ chmod 640 "${XRAY_CONFIG}"
 # ------------------------------------------------------------
 
 echo
-echo "Validating Xray configuration..."
+echo "Testing Xray configuration..."
 
 if ! xray run -test -config "${XRAY_CONFIG}"; then
-    die "Xray configuration validation failed."
+    die "Xray configuration test failed."
 fi
 
 echo
-echo "Configuration validation successful."
+echo "Configuration test passed."
 
 # ------------------------------------------------------------
-# 8. Configure UFW
+# UFW
 # ------------------------------------------------------------
 
 echo
 echo "[8/9] Configuring Ubuntu firewall..."
 
-if command_exists ufw; then
+if command -v ufw >/dev/null 2>&1; then
 
+    # SSH
     ufw allow OpenSSH >/dev/null || true
+
+    # Xray
     ufw allow 443/tcp >/dev/null || true
 
     if ufw status | grep -q "Status: inactive"; then
@@ -386,14 +433,11 @@ if command_exists ufw; then
     fi
 
     echo
-    echo "UFW status:"
     ufw status
-else
-    echo "UFW is not installed."
 fi
 
 # ------------------------------------------------------------
-# 9. Start Xray
+# Start Xray
 # ------------------------------------------------------------
 
 echo
@@ -423,7 +467,7 @@ if ! systemctl is-active --quiet xray; then
 fi
 
 # ------------------------------------------------------------
-# Verify listener
+# Check listener
 # ------------------------------------------------------------
 
 echo
@@ -432,12 +476,11 @@ echo "Checking TCP 443..."
 if ss -lntp | grep -q ':443'; then
     echo "SUCCESS: Xray is listening on TCP 443."
 else
-    echo
-    echo "WARNING: TCP 443 does not appear to be listening."
+    echo "WARNING: TCP 443 is not currently visible."
 fi
 
 # ------------------------------------------------------------
-# Create client information
+# Client info
 # ------------------------------------------------------------
 
 cat > "${CLIENT_INFO}" <<EOF
@@ -496,26 +539,25 @@ IMPORTANT
 
 Replace:
 
-    YOUR_AZURE_PUBLIC_IP
+YOUR_AZURE_PUBLIC_IP
 
-with your Azure VM public IP.
+with the public IP of your Azure VM.
 
-DO NOT share the REALITY private key.
+The REALITY private key is server-side.
+Do NOT share it.
 
 The client uses the REALITY PUBLIC KEY.
 ============================================================
 EOF
 
-chmod 600 "${CLIENT_INFO}"
-
 # ------------------------------------------------------------
-# Server information
+# Server info
 # ------------------------------------------------------------
 
 cat > "${SERVER_INFO}" <<EOF
 Xray VLESS + REALITY server
 
-Installed Xray:
+Xray:
 $(xray version | head -n 1)
 
 Target:
@@ -540,7 +582,32 @@ Short ID:
 ${SHORT_ID}
 EOF
 
-chmod 600 "${SERVER_INFO}"
+# ------------------------------------------------------------
+# Ownership / permissions for generated files
+# ------------------------------------------------------------
+
+chown "${INSTALL_USER}:${INSTALL_GROUP}" \
+    "${CLIENT_INFO}" \
+    "${SERVER_INFO}"
+
+chmod 600 \
+    "${CLIENT_INFO}" \
+    "${SERVER_INFO}"
+
+# Runtime directory remains fully accessible to the user.
+chown -R "${INSTALL_USER}:${INSTALL_GROUP}" "${RUNTIME_DIR}"
+chmod 700 "${RUNTIME_DIR}"
+chmod 700 "${BACKUP_DIR}"
+
+# Restore secret file permissions after recursive ownership.
+chmod 600 \
+    "${PRIVATE_KEY_FILE}" \
+    "${PUBLIC_KEY_FILE}" \
+    "${UUID_FILE}" \
+    "${SHORT_ID_FILE}" \
+    "${TARGET_FILE}" \
+    "${CLIENT_INFO}" \
+    "${SERVER_INFO}"
 
 # ------------------------------------------------------------
 # Final output
@@ -553,8 +620,12 @@ echo " INSTALLATION COMPLETE"
 echo "============================================================"
 echo
 
-echo "Xray:"
+echo "Xray status:"
 systemctl is-active xray
+
+echo
+echo "Xray version:"
+xray version | head -n 1
 
 echo
 echo "Listening:"
@@ -565,33 +636,43 @@ echo "Repository:"
 echo "  ${SCRIPT_DIR}"
 
 echo
-echo "Generated runtime files:"
-echo "  ${RUNTIME_DIR}/"
+echo "Runtime:"
+echo "  ${RUNTIME_DIR}"
 
 echo
-echo "Client configuration:"
+echo "Client information:"
 echo "  ${CLIENT_INFO}"
 
 echo
-echo "Show client information:"
-echo "  sudo cat '${CLIENT_INFO}'"
-
+echo "Display client information:"
 echo
-echo "Server configuration:"
-echo "  ${XRAY_CONFIG}"
-
+echo "  cat '${CLIENT_INFO}'"
 echo
+
 echo "============================================================"
-echo " AZURE REQUIREMENT"
+echo " AZURE NSG"
 echo "============================================================"
 echo
-echo "Azure NSG must allow:"
+echo "Make sure Azure allows:"
 echo
-echo "  TCP 443"
+echo "  TCP 443  ->  Allow"
 echo
-echo "SSH remains on:"
-echo "  TCP 22"
+echo "SSH:"
 echo
-echo "Do NOT expose port 8080 for this configuration."
+echo "  TCP 22   ->  Allow"
 echo
+echo "No 8080 rule is required."
+echo
+
+echo "============================================================"
+echo " GIT"
+echo "============================================================"
+echo
+echo "runtime/ has been added to .gitignore."
+echo
+echo "Verify with:"
+echo
+echo "  git status"
+echo
+
 echo "============================================================"
