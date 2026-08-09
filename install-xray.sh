@@ -3,34 +3,95 @@ set -euo pipefail
 
 # ============================================================
 # Xray VLESS + REALITY installer
-# Ubuntu 24.04 / Xray stable
+#
+# Repository:
+#   ~/vless-reality-xray-installer
+#
+# Generated runtime/secrets:
+#   ~/vless-reality-xray-installer/runtime
+#
+# Xray configuration:
+#   /usr/local/etc/xray/config.json
+#
+# The runtime directory MUST NOT be committed to Git.
 # ============================================================
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+RUNTIME_DIR="${SCRIPT_DIR}/runtime"
+
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
-BACKUP_DIR="/root/xray-backups"
-CLIENT_INFO="/root/xray-client.txt"
+XRAY_CONFIG_DIR="/usr/local/etc/xray"
 
-echo
-echo "================================================"
-echo " Xray VLESS + REALITY Installer"
-echo "================================================"
-echo
+CLIENT_INFO="${RUNTIME_DIR}/client-info.txt"
+SERVER_INFO="${RUNTIME_DIR}/server-info.txt"
+PRIVATE_KEY_FILE="${RUNTIME_DIR}/reality-private-key.txt"
+PUBLIC_KEY_FILE="${RUNTIME_DIR}/reality-public-key.txt"
+UUID_FILE="${RUNTIME_DIR}/uuid.txt"
+SHORT_ID_FILE="${RUNTIME_DIR}/short-id.txt"
+TARGET_FILE="${RUNTIME_DIR}/target.txt"
 
-if [[ "$EUID" -ne 0 ]]; then
-    echo "ERROR: Run this script with sudo."
+BACKUP_DIR="${RUNTIME_DIR}/backups"
+
+# ------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------
+
+die() {
     echo
-    echo "Example:"
-    echo "  sudo ./install-xray.sh"
+    echo "ERROR: $*"
+    echo
     exit 1
+}
+
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+# ------------------------------------------------------------
+# Check root
+# ------------------------------------------------------------
+
+if [[ "${EUID}" -ne 0 ]]; then
+    die "Run this script with sudo:
+
+    sudo ./install-xray.sh"
 fi
 
+echo
+echo "============================================================"
+echo " Xray VLESS + REALITY Installer"
+echo "============================================================"
+echo
+echo "Repository:"
+echo "  ${SCRIPT_DIR}"
+echo
+echo "Runtime data:"
+echo "  ${RUNTIME_DIR}"
+echo
+
 # ------------------------------------------------------------
-# 1. Ubuntu dependencies
+# 1. Create runtime directory
 # ------------------------------------------------------------
 
-echo "[1/8] Installing required packages..."
+echo "[1/9] Preparing runtime directory..."
+
+mkdir -p "${RUNTIME_DIR}"
+mkdir -p "${BACKUP_DIR}"
+
+# Only root should be able to read generated secrets.
+chown -R root:root "${RUNTIME_DIR}"
+chmod 700 "${RUNTIME_DIR}"
+chmod 700 "${BACKUP_DIR}"
+
+# ------------------------------------------------------------
+# 2. Install required packages
+# ------------------------------------------------------------
+
+echo
+echo "[2/9] Installing required packages..."
 
 apt-get update
+
 apt-get install -y \
     curl \
     ca-certificates \
@@ -39,150 +100,154 @@ apt-get install -y \
     jq
 
 # ------------------------------------------------------------
-# 2. Install/update Xray
+# 3. Install/update Xray
 # ------------------------------------------------------------
 
 echo
-echo "[2/8] Installing/updating Xray..."
+echo "[3/9] Installing/updating Xray..."
 
 bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
 
-if ! command -v xray >/dev/null 2>&1; then
-    echo "ERROR: Xray installation failed."
-    exit 1
-fi
+command_exists xray || die "Xray installation failed."
 
 echo
+echo "Installed Xray:"
 xray version
 
 # ------------------------------------------------------------
-# 3. Choose and test REALITY target
+# 4. Select REALITY target
 # ------------------------------------------------------------
 
 echo
-echo "[3/8] REALITY target"
+echo "[4/9] Selecting REALITY target"
 echo
 echo "Enter a normal HTTPS hostname."
-echo "The script will test it with:"
-echo "  xray tls ping HOST:443"
 echo
-echo "Press Enter to use www.cloudflare.com."
+echo "The target will be tested with:"
+echo
+echo "    xray tls ping HOST:443"
+echo
+echo "Press ENTER to use:"
+echo
+echo "    www.cloudflare.com"
 echo
 
 read -r -p "Target hostname [www.cloudflare.com]: " TARGET
 
 TARGET="${TARGET:-www.cloudflare.com}"
 
-# Remove protocol if accidentally supplied
+# Clean accidental protocol/path/port input.
 TARGET="${TARGET#https://}"
 TARGET="${TARGET#http://}"
-
-# Remove path
 TARGET="${TARGET%%/*}"
-
-# Remove port
 TARGET="${TARGET%%:*}"
 
+[[ -n "${TARGET}" ]] || die "Target hostname is empty."
+
 echo
-echo "Testing target:"
-echo "  ${TARGET}:443"
+echo "Testing:"
+echo "    ${TARGET}:443"
 echo
 
 if ! xray tls ping "${TARGET}:443"; then
-    echo
-    echo "ERROR: TLS test failed for ${TARGET}:443"
-    echo
-    echo "Choose another HTTPS hostname and run the script again."
-    exit 1
+    die "TLS test failed for ${TARGET}:443.
+
+Choose another HTTPS hostname and run the installer again."
 fi
 
 echo
-echo "Target TLS test succeeded."
+echo "TLS target test succeeded."
+
+printf '%s\n' "${TARGET}" > "${TARGET_FILE}"
 
 # ------------------------------------------------------------
-# 4. Generate UUID
+# 5. Generate UUID
 # ------------------------------------------------------------
 
 echo
-echo "[4/8] Generating UUID..."
+echo "[5/9] Generating VLESS UUID..."
 
 UUID="$(xray uuid | tr -d '\r\n[:space:]')"
 
-if [[ -z "$UUID" ]]; then
-    echo "ERROR: Could not generate UUID."
-    exit 1
-fi
+[[ -n "${UUID}" ]] || die "Could not generate UUID."
+
+printf '%s\n' "${UUID}" > "${UUID_FILE}"
 
 echo "UUID generated."
 
 # ------------------------------------------------------------
-# 5. Generate REALITY X25519 key pair
+# 6. Generate REALITY key pair
 # ------------------------------------------------------------
 
 echo
-echo "[5/8] Generating REALITY X25519 key pair..."
+echo "[6/9] Generating REALITY X25519 key pair..."
 
 KEY_OUTPUT="$(xray x25519)"
 
 echo
-echo "Xray key generator output:"
-echo "$KEY_OUTPUT"
+echo "Xray key generator:"
+echo "${KEY_OUTPUT}"
 echo
 
-# Xray v26.x format:
+# Current Xray format:
 #
 # PrivateKey: ...
 # Password (PublicKey): ...
 # Hash32: ...
 #
 PRIVATE_KEY="$(
-    printf '%s\n' "$KEY_OUTPUT" |
+    printf '%s\n' "${KEY_OUTPUT}" |
     sed -n 's/^PrivateKey: //p' |
     head -n 1 |
     tr -d '\r'
 )"
 
 PUBLIC_KEY="$(
-    printf '%s\n' "$KEY_OUTPUT" |
+    printf '%s\n' "${KEY_OUTPUT}" |
     sed -n 's/^Password (PublicKey): //p' |
     head -n 1 |
     tr -d '\r'
 )"
 
-# Fallback for older Xray output formats
-if [[ -z "$PUBLIC_KEY" ]]; then
+# Compatibility fallback for older versions.
+if [[ -z "${PRIVATE_KEY}" ]]; then
+    PRIVATE_KEY="$(
+        printf '%s\n' "${KEY_OUTPUT}" |
+        sed -n 's/^Private key: //p' |
+        head -n 1 |
+        tr -d '\r'
+    )"
+fi
+
+if [[ -z "${PUBLIC_KEY}" ]]; then
     PUBLIC_KEY="$(
-        printf '%s\n' "$KEY_OUTPUT" |
+        printf '%s\n' "${KEY_OUTPUT}" |
         sed -n 's/^Password: //p' |
         head -n 1 |
         tr -d '\r'
     )"
 fi
 
-if [[ -z "$PUBLIC_KEY" ]]; then
+if [[ -z "${PUBLIC_KEY}" ]]; then
     PUBLIC_KEY="$(
-        printf '%s\n' "$KEY_OUTPUT" |
+        printf '%s\n' "${KEY_OUTPUT}" |
         sed -n 's/^PublicKey: //p' |
         head -n 1 |
         tr -d '\r'
     )"
 fi
 
-if [[ -z "$PRIVATE_KEY" ]]; then
-    echo "ERROR: Could not extract X25519 private key."
-    exit 1
-fi
+[[ -n "${PRIVATE_KEY}" ]] || die "Could not extract REALITY private key."
 
-if [[ -z "$PUBLIC_KEY" ]]; then
-    echo "ERROR: Could not extract X25519 public key."
-    echo
-    echo "You can manually obtain it with:"
-    echo
-    echo "xray x25519 -i \"$PRIVATE_KEY\""
-    exit 1
-fi
+[[ -n "${PUBLIC_KEY}" ]] || die "Could not extract REALITY public key."
 
-echo "REALITY key pair generated successfully."
+printf '%s\n' "${PRIVATE_KEY}" > "${PRIVATE_KEY_FILE}"
+printf '%s\n' "${PUBLIC_KEY}" > "${PUBLIC_KEY_FILE}"
+
+chmod 600 "${PRIVATE_KEY_FILE}"
+chmod 600 "${PUBLIC_KEY_FILE}"
+
+echo "REALITY key pair generated."
 
 # ------------------------------------------------------------
 # Generate short ID
@@ -190,39 +255,43 @@ echo "REALITY key pair generated successfully."
 
 SHORT_ID="$(openssl rand -hex 8)"
 
-if [[ ! "$SHORT_ID" =~ ^[0-9a-f]{16}$ ]]; then
-    echo "ERROR: Invalid short ID generated."
-    exit 1
-fi
+[[ "${SHORT_ID}" =~ ^[0-9a-f]{16}$ ]] ||
+    die "Generated invalid REALITY short ID."
+
+printf '%s\n' "${SHORT_ID}" > "${SHORT_ID_FILE}"
+
+chmod 600 "${UUID_FILE}"
+chmod 600 "${SHORT_ID_FILE}"
+chmod 600 "${TARGET_FILE}"
 
 echo "Short ID generated."
 
 # ------------------------------------------------------------
-# 6. Backup old configuration
+# 7. Backup existing Xray configuration
 # ------------------------------------------------------------
 
 echo
-echo "[6/8] Preparing Xray configuration..."
+echo "[7/9] Preparing Xray configuration..."
 
-mkdir -p "$BACKUP_DIR"
+mkdir -p "${XRAY_CONFIG_DIR}"
 
-if [[ -f "$XRAY_CONFIG" ]]; then
+if [[ -f "${XRAY_CONFIG}" ]]; then
 
     BACKUP_FILE="${BACKUP_DIR}/config-$(date +%Y%m%d-%H%M%S).json"
 
-    cp "$XRAY_CONFIG" "$BACKUP_FILE"
+    cp "${XRAY_CONFIG}" "${BACKUP_FILE}"
 
-    echo "Existing configuration backed up to:"
-    echo "  $BACKUP_FILE"
+    chmod 600 "${BACKUP_FILE}"
+
+    echo "Existing configuration backed up:"
+    echo "  ${BACKUP_FILE}"
 fi
 
-mkdir -p "$(dirname "$XRAY_CONFIG")"
-
 # ------------------------------------------------------------
-# Write configuration
+# Write Xray configuration
 # ------------------------------------------------------------
 
-cat > "$XRAY_CONFIG" <<EOF
+cat > "${XRAY_CONFIG}" <<EOF
 {
   "log": {
     "loglevel": "warning"
@@ -275,35 +344,39 @@ cat > "$XRAY_CONFIG" <<EOF
 }
 EOF
 
-chmod 600 "$XRAY_CONFIG"
+# IMPORTANT:
+# The Xray systemd service installed by the official installer
+# runs as "nobody". It therefore needs read access to config.json.
+#
+# root owns the file.
+# group "nogroup" gets read access.
+# nobody belongs to nogroup on standard Ubuntu installations.
+
+chown root:nogroup "${XRAY_CONFIG}"
+chmod 640 "${XRAY_CONFIG}"
 
 # ------------------------------------------------------------
-# Test configuration
+# Validate configuration
 # ------------------------------------------------------------
 
 echo
-echo "Testing Xray configuration..."
+echo "Validating Xray configuration..."
 
-if ! xray run -test -config "$XRAY_CONFIG"; then
-    echo
-    echo "================================================"
-    echo " ERROR: Xray configuration test failed"
-    echo "================================================"
-    echo
-    exit 1
+if ! xray run -test -config "${XRAY_CONFIG}"; then
+    die "Xray configuration validation failed."
 fi
 
 echo
-echo "Xray configuration is valid."
+echo "Configuration validation successful."
 
 # ------------------------------------------------------------
-# 7. Configure UFW
+# 8. Configure UFW
 # ------------------------------------------------------------
 
 echo
-echo "[7/8] Configuring Ubuntu firewall..."
+echo "[8/9] Configuring Ubuntu firewall..."
 
-if command -v ufw >/dev/null 2>&1; then
+if command_exists ufw; then
 
     ufw allow OpenSSH >/dev/null || true
     ufw allow 443/tcp >/dev/null || true
@@ -313,17 +386,18 @@ if command -v ufw >/dev/null 2>&1; then
     fi
 
     echo
+    echo "UFW status:"
     ufw status
 else
-    echo "UFW is not installed. Skipping UFW configuration."
+    echo "UFW is not installed."
 fi
 
 # ------------------------------------------------------------
-# 8. Start Xray
+# 9. Start Xray
 # ------------------------------------------------------------
 
 echo
-echo "[8/8] Starting Xray..."
+echo "[9/9] Starting Xray..."
 
 systemctl daemon-reload
 systemctl enable xray
@@ -334,33 +408,44 @@ sleep 2
 if ! systemctl is-active --quiet xray; then
 
     echo
-    echo "================================================"
-    echo " ERROR: Xray failed to start"
-    echo "================================================"
+    echo "============================================================"
+    echo " Xray FAILED TO START"
+    echo "============================================================"
     echo
 
-    systemctl --no-pager status xray || true
+    systemctl --no-pager -l status xray || true
 
     echo
-    echo "Recent Xray logs:"
+    echo "Recent logs:"
     journalctl -u xray --no-pager -n 50 || true
 
     exit 1
 fi
 
 # ------------------------------------------------------------
-# Save client information
+# Verify listener
 # ------------------------------------------------------------
 
 echo
-echo "Saving client configuration..."
+echo "Checking TCP 443..."
 
-cat > "$CLIENT_INFO" <<EOF
+if ss -lntp | grep -q ':443'; then
+    echo "SUCCESS: Xray is listening on TCP 443."
+else
+    echo
+    echo "WARNING: TCP 443 does not appear to be listening."
+fi
+
+# ------------------------------------------------------------
+# Create client information
+# ------------------------------------------------------------
+
+cat > "${CLIENT_INFO}" <<EOF
 ============================================================
-Xray VLESS + REALITY CLIENT INFORMATION
+Xray VLESS + REALITY
 ============================================================
 
-SERVER ADDRESS:
+SERVER:
 YOUR_AZURE_PUBLIC_IP
 
 PORT:
@@ -402,52 +487,111 @@ ${TARGET}:443
 
 VLESS URI:
 
-vless://${UUID}@YOUR_AZURE_PUBLIC_IP:443?encryption=none&security=reality&sni=${TARGET}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&flow=xtls-rprx-vision&type=raw#Azure-Xray
+vless://${UUID}@YOUR_AZURE_PUBLIC_IP:443?encryption=none&security=reality&sni=${TARGET}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&flow=xtls-rprx-vision&type=tcp#Azure-Xray
+
+
+============================================================
+IMPORTANT
+============================================================
+
+Replace:
+
+    YOUR_AZURE_PUBLIC_IP
+
+with your Azure VM public IP.
+
+DO NOT share the REALITY private key.
+
+The client uses the REALITY PUBLIC KEY.
 ============================================================
 EOF
 
-chmod 600 "$CLIENT_INFO"
+chmod 600 "${CLIENT_INFO}"
 
 # ------------------------------------------------------------
-# Final checks
+# Server information
+# ------------------------------------------------------------
+
+cat > "${SERVER_INFO}" <<EOF
+Xray VLESS + REALITY server
+
+Installed Xray:
+$(xray version | head -n 1)
+
+Target:
+${TARGET}:443
+
+Listen:
+0.0.0.0:443
+
+Protocol:
+VLESS
+
+Transport:
+RAW
+
+Security:
+REALITY
+
+UUID:
+${UUID}
+
+Short ID:
+${SHORT_ID}
+EOF
+
+chmod 600 "${SERVER_INFO}"
+
+# ------------------------------------------------------------
+# Final output
 # ------------------------------------------------------------
 
 echo
-echo "Checking port 443..."
-
-if ss -lntp | grep -q ':443'; then
-    echo "TCP 443 is listening."
-else
-    echo "WARNING: Nothing appears to be listening on TCP 443."
-fi
-
 echo
 echo "============================================================"
 echo " INSTALLATION COMPLETE"
 echo "============================================================"
 echo
 
-echo "Xray service:"
+echo "Xray:"
 systemctl is-active xray
 
 echo
-echo "Xray version:"
-xray version
+echo "Listening:"
+ss -lntp | grep ':443' || true
 
 echo
-echo "Client configuration saved at:"
-echo "  $CLIENT_INFO"
+echo "Repository:"
+echo "  ${SCRIPT_DIR}"
 
 echo
-echo "Display client configuration with:"
-echo "  sudo cat $CLIENT_INFO"
+echo "Generated runtime files:"
+echo "  ${RUNTIME_DIR}/"
 
 echo
-echo "IMPORTANT:"
-echo "1. Azure NSG must allow TCP 443."
-echo "2. Replace YOUR_AZURE_PUBLIC_IP in the VLESS URI."
-echo "3. Never share the REALITY private key."
-echo "4. The client uses the PUBLIC key, not the private key."
+echo "Client configuration:"
+echo "  ${CLIENT_INFO}"
 
+echo
+echo "Show client information:"
+echo "  sudo cat '${CLIENT_INFO}'"
+
+echo
+echo "Server configuration:"
+echo "  ${XRAY_CONFIG}"
+
+echo
+echo "============================================================"
+echo " AZURE REQUIREMENT"
+echo "============================================================"
+echo
+echo "Azure NSG must allow:"
+echo
+echo "  TCP 443"
+echo
+echo "SSH remains on:"
+echo "  TCP 22"
+echo
+echo "Do NOT expose port 8080 for this configuration."
 echo
 echo "============================================================"
